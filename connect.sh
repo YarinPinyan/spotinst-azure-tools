@@ -11,9 +11,19 @@ readonly APP_AVAILALBE_TO_OTHER_TENANTS="false"
 readonly SECRETS_STORE="/tmp/spot_azure_secrets_store.json"
 readonly ACCOUNTS_STORE="/tmp/spot_azure_accounts_store.json"
 readonly TEMP_APP_DETAILS_LOCATION="/tmp/spot_app_azure_details.json"
+readonly ON_FAILURE_CLEANUP_FOLDER="/tmp/spot_azure_on_failure.json"
+readonly RESOURCE_FILE="/tmp/spot_azure_created_resources.json"
+readonly RESOURCE_FILE_TEMP="/tmp/spot_azure_created_resources_temp.json"
+readonly NO_SIGNAL_SUCCESS="NO_SIGNAL_SUCCESS"
+readonly EXISTING_ROLE_ASSIGNMENT_REFERENCE_ON_DELETION="There are existing role assignments referencing"
+
+function init {
+	echo "{}" > $RESOURCE_FILE
+	echo "{}" > $RESOURCE_FILE_TEMP
+}
 
 function cleanup {
-	rm $POLICY_FILE_NAME_TEMP $POLICY_FILE_NAME $ACCOUNTS_STORE $SECRETS_STORE $TEMP_APP_DETAILS_LOCATION
+	rm $POLICY_FILE_NAME_TEMP $POLICY_FILE_NAME $ACCOUNTS_STORE $SECRETS_STORE $TEMP_APP_DETAILS_LOCATION $ON_FAILURE_CLEANUP_FOLDER
 }
 
 function format_timestamp {
@@ -51,10 +61,61 @@ function getDate {
 	echo $date_az
 }
 
+function deleteAppRegistration {
+	# receives application id as $1
+	app_id=`echo $i | jq -r '.resourceId'`
+	execute_with_backoff "$NO_SIGNAL_SUCCESS" "az" "ad" "app" "delete" "--id" "$app_id"
+}
+
+function deleteIamRole {
+	# receives iam role id as $1
+	iam_role=`echo $1 | jq -r '.resourceId'`
+	execute_with_backoff "$NO_SIGNAL_SUCCESS" "az" "ad" "app" "delete" "--id" "$app_id"
+}
+
+function deleteRoleAssignment {
+	# receives role assignment id as $1
+	iam_role=`echo $1 | jq -r '.resourceId'`
+	execute_with_backoff "$NO_SIGNAL_SUCCESS" "az" "role" "assignment" "delete" "--role" "$iam_role"
+}
+
+function deleteServicePrincipals {
+	# receives service principal id as $1
+	service_principals=`echo $1 | jq -r '.resourceId'`
+	execute_with_backoff "$NO_SIGNAL_SUCCESS" "az" "ad" "sp" "credential" "delete" "--id" "$service_principals"
+}
+
+function cleanupCreatedResources {
+
+	read -p "Start deleting resources..."
+	jq -c '.[]' $RESOURCE_FILE | while read i; do
+		read -p "Waitttttt"
+		case "$i" in
+			*"appRegistration"* ) deleteAppRegistration $i ;;
+			*"iamRole"* ) deleteIamRole $i ;;
+			*"servicePrincipals"* ) deleteServicePrincipals $i ;;
+			*"roleAssignment"* ) deleteRoleAssignment $i ;;
+			*"spotAccount"* ) ;;
+		esac
+	done
+}
+
 KeyboardInterrupt() {
+	while true; do
+		read -p "Would you like to cleann the created resources before the failure?" choice
+		case "$choice" in 
+		  y|Y ) echo "yes"; cleanupCreatedResources; break;;
+		  n|N ) echo "no"; break;;
+		  * ) echo "Invalid, please run again.";;
+		esac
+	done
+
 	kill $PID
 	echo "Please make sure you continued from where you've stopped"
+	exit
 }
+
+trap KeyboardInterrupt SIGINT
 
 function azureCliNotSupported() { log_error "Azure CLI is not installed in your OS. In order to make this script work, please install it and then proceed"; exit 0; }
 
@@ -107,7 +168,7 @@ function createAppRegistration {
 		registeredApplicationDetails==`az ad app create --display-name $chosenApplicationName --reply-urls "$SPOT_IDENTIFIER_URI" --available-to-other-tenants $APP_AVAILALBE_TO_OTHER_TENANTS`
 
 		case "$registeredApplicationDetails" in 
-	  		*"$APP_CREATION_SIGNAL"*) echo "Application Created Successfully"; echo $registeredApplicationDetails > $TEMP_APP_DETAILS_LOCATION; parseAzureFile $TEMP_APP_DETAILS_LOCATION; break;;
+	  		*"$APP_CREATION_SIGNAL"*) echo "Application Created Successfully"; echo $registeredApplicationDetails > $TEMP_APP_DETAILS_LOCATION; parseAzureFile $TEMP_APP_DETAILS_LOCATION; saveCreatedResourceToJsonObject "appRegistration" $(getAppId); break;;
 	  		* ) echo "Invalid, please run again.";;
 		esac
 	done
@@ -119,6 +180,15 @@ function getAppId {
 	local appId=`cat $TEMP_APP_DETAILS_LOCATION | jq -r ".appId"`
 	echo $appId
 
+}
+
+function saveCreatedResourceToJsonObject {
+	local resource_type=$1
+	local resource_id=$2
+
+	local TEMP_VAR="TEMP_SPOT_AZURE_APP_RESOURCE_LOCATION"
+	local file_data=`cat $RESOURCE_FILE`
+	echo $file_data | jq --arg resourceType $resource_type --arg resourceId $resource_id '. + {TEMP_SPOT_AZURE_APP_RESOURCE_LOCATION: {resourceId: $resourceId , resourceType: $resourceType }}' | sed "s/$TEMP_VAR/$resource_type/g" > $RESOURCE_FILE_TEMP && cp $RESOURCE_FILE_TEMP $RESOURCE_FILE && echo "" > $RESOURCE_FILE_TEMP
 }
 
 function validateCreatedRole {
@@ -152,7 +222,6 @@ function connectSubscription {
 	local MAX_ATTEMPTS=5
 	local attempts=0
 	local timeout=1
-
 
 	log_info "Params: token: $token\nAccountId: $accountId\ntenantId: $tenantId\nsubscriptionId: $subscriptionId\nclientId: $clientId\nclientSecret: $clientSecret"
 	read -p "Would you like to continue?: "
@@ -207,7 +276,7 @@ function assignRole {
 		role_name=$2
 		request=`az role assignment create --assignee $application_id --role $role_name`
 		case "$request" in 
-	  		*"$REQUEST_SUCCESS_CRITERIA"*) log_info "Successfully assigned IAM Role to Spot Azure Application"; CREATION_SUCCEEDED=1; break;;
+	  		*"$REQUEST_SUCCESS_CRITERIA"*) log_info "Successfully assigned IAM Role to Spot Azure Application"; CREATION_SUCCEEDED=1; saveCreatedResourceToJsonObject "roleAssignment" "$role_name"; break;;
 	  		* ) log_error "Failed at $i attempt, retrying to assign role to application";;
 		esac
 	done
@@ -219,7 +288,42 @@ function assignRole {
 
 }
 
+function execute_with_backoff {
+	local MAX_ATTEMPTS=5
+	local attempts=0
+	local timeout=1
+	local IS_REQUEST_SUCCEEDED=0
+	local SIGNAL_CRITERIA_SUCCESS_OUTPUT=$1
+	shift
+	local cmds="$@"
+
+	log_info "Command to execute: $cmds"
+
+	while [[ $attempts < $MAX_ATTEMPTS ]]; do
+		{ req="$( { special_execute $cmds; } 2>&1 1>&3 3>&- )"; } 3>&1;
+
+		if [[ $(echo $req | tr '[:upper:]' '[:lower:]') != *"error"* ]]; then
+			log_info "Successfully executed command. request output: $req"
+			IS_REQUEST_SUCCEEDED=1
+			break
+		fi
+
+    	sleep $timeout
+		((attempts=attempts+1))
+		timeout=$(( timeout * 2 ))
+	done
+
+	if [[ $IS_REQUEST_SUCCEEDED -eq 0 ]]; then
+		log_error "Failed to execute command: $cmds"
+	fi
+
+
+}
+function special_execute() { set -x; "$@"; set +x; }
+
+
 function handle {
+
 	azure_list_accounts=`az account list -o json`
 	log_info "These are the following available Azure accounts linked to your user, please choose one to connect to spot"
 	echo $azure_list_accounts | jq ".[].name" | tr -d '"'
@@ -246,17 +350,15 @@ function handle {
 	secret_details=`az ad app credential reset --id $application_id --end-date $newApplicationExpirationDate`
 	echo $secret_details > $SECRETS_STORE
 
-	log_info "Application $appId has a token endDate set for $newApplicationExpirationDate"
-	log_info "Start creating custom role..." && sleep 2
+	# saveCreatedResourceToJsonObject "secrets" "$application_id" "$secret_details"
+
+	log_info "Start creating custom role...\n" && sleep 2
 
 	read -p "Please pick a name for the Spot for Azure IAM Role: " iam_role_name
 
 	curl -X GET https://spotinst-public.s3.amazonaws.com/assets/azure/custom_role_file.json > $POLICY_FILE_NAME
-	# echo $spotAzureCustomRolePermissions | jq '. + {"Name": "$chosenIamRoleName"}'
 
 	subscriptionId=`echo $azure_list_accounts | jq -r --arg account "$account_to_connect" '.[] | select(.name==$account).id' | tr -d '"'`
-	# sed -e "s/\${roleName}/$chosenIamRoleName/" -e "s/\${subscriptionId}/$subscriptionId/"` $spotAzureCustomRolePermissions
-	# echo $spotAzureCustomRolePermissions
 
 	policyData=`cat $POLICY_FILE_NAME | jq '.properties'`
 	echo $policyData > $POLICY_FILE_NAME
@@ -271,23 +373,27 @@ function handle {
 
 	spot_azure_created_role=`az role definition create --role-definition $POLICY_FILE_NAME`
 
+	saveCreatedResourceToJsonObject "iamRole" "$iam_role_name" 
+
 	log_info "Assigning role to service principals" & sleep 10
 		
 	# create SP for app
 	service_principal_details=`az ad sp create --id $application_id`
 	service_principal_dp=`echo $service_principal_details | jq -r '.displayName'`
 
+	saveCreatedResourceToJsonObject "servicePrincipals" "$service_principal_dp"
+
 	assignRole $application_id $iam_role_name
 
 	echo $azure_list_accounts | jq -r --arg account "$account_to_connect" '.[] | select(.name==$account)' > $ACCOUNTS_STORE
 
 	connectAzureAccount
-
 	log_info "Finished"
 
 }
 
 function main {
+  init
   validate
   handle
   cleanup
