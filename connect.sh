@@ -161,7 +161,6 @@ function parseAzureFile {
 	local shouldRemoveFirstCharacter=`head -c 1 $1`
 
 	if [[ "$shouldRemoveFirstCharacter" == "=" ]]; then
-		echo "In cond"
 		echo `cat $1 | cut -c2-500000` > $1
 	fi
 }
@@ -311,8 +310,7 @@ function execute_with_backoff {
 			log_info "Successfully executed command. request output: $req"
 			IS_REQUEST_SUCCEEDED=1
 			if [[ "$SIGNAL_CRITERIA_SUCCESS_OUTPUT" != "$NO_SIGNAL_SUCCESS" ]]; then
-				echo "in cond"
-				 eval $SIGNAL_CRITERIA_SUCCESS_OUTPUT=1
+				eval $SIGNAL_CRITERIA_SUCCESS_OUTPUT=1
 			fi
 			break
 		fi
