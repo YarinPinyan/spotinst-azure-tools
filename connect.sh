@@ -265,7 +265,7 @@ function connectSubscription {
 function connectAzureAccount {
 	# Get valid account id
 	while true; do 
-		read -p "Please enter valid accountId that matches the regex of ^\s*(act-[^\W_]{8})\s*$:    " spotinstAccountId
+		read -p "Please enter valid accountId that matches the regex of ^\s*(act-[^\W_]{8})\s*$: " spotinstAccountId
 		if [[ "$spotinstAccountId" =~ ^\s*(act-[^\W_]{8})\s*$ ]]; then
 			break
 		fi
@@ -283,7 +283,8 @@ function assignRole {
 	for i in {1..20}; do
 		application_id=$1
 		role_name=$2
-		request=`az role assignment create --assignee $application_id --role $role_name`
+		log_info "Starting to assign role {$role_name} to application {$application_id}"
+		request=`az role assignment create --assignee $application_id --role $role_name --subscription $subscriptionId`
 		case "$request" in 
 	  		*"$REQUEST_SUCCESS_CRITERIA"*) log_info "Successfully assigned IAM Role to Spot Azure Application"; SIGNAL_ROLE_ASSIGNMENT_SUCCESS=1; saveCreatedResourceToJsonObject "roleAssignment" "$role_name"; break;;
 	  		* ) log_error "Failed at $i attempt, retrying to assign role to application";;
@@ -363,6 +364,10 @@ function validateCreatedResource {
 	fi
 }
 
+# function validateServicePrincipals {
+
+# }
+
 function resetSecrets {
 	local application_id=$1
     newApplicationExpirationDate=$(getDate)
@@ -403,6 +408,7 @@ function handle {
 		if [[ $SIGNAL_APPLICATION_SECRET_RESET -eq 1 ]]; then
 			read -p "Please pick a name for the Spot for Azure IAM Role: " iam_role_name
 			echo $azure_list_accounts > $ACCOUNTS_STORE
+			subscriptionId=`echo $azure_list_accounts | jq -r --arg account "$account_to_connect" '.[] | select(.name==$account).id' | tr -d '"'`
 			createIamRole "$iam_role_name" "$account_to_connect"
 			echo $SIGNAL_IAM_ROLE_CREATION
 			if [[ $SIGNAL_IAM_ROLE_CREATION -eq 1 ]]; then
@@ -412,16 +418,14 @@ function handle {
 				service_principal_dp=`echo $service_principal_details | jq -r '.displayName'`
 				if [[ ! -z $(validateCreatedResource $service_principal_dp) ]]; then
 					eval $SIGNAL_SERVICE_PRINCIPAL_CREATION_ENUM=1
-					if [[ $SIGNAL_SERVICE_PRINCIPAL_CREATION -eq 1 ]]; then
-						saveCreatedResourceToJsonObject "servicePrincipals" "$service_principal_dp"
-						assignRole $application_id $iam_role_name
-						if [[ $SIGNAL_ROLE_ASSIGNMENT_SUCCESS -eq 1 ]]; then
-							# store account details to connect spot account
-							echo $azure_list_accounts | jq -r --arg account "$account_to_connect" '.[] | select(.name==$account)' > $ACCOUNTS_STORE
-							connectAzureAccount
-							if [[ $SIGNAL_SPOT_AZURE_SUBSCRIPTION_CONNECTED_SUCCESS -eq 1 ]]; then
-								log_info "Successfully connected subscription to spot account."
-							fi
+					saveCreatedResourceToJsonObject "servicePrincipals" "$service_principal_dp"
+					assignRole $application_id $iam_role_name $subscriptionId
+					if [[ $SIGNAL_ROLE_ASSIGNMENT_SUCCESS -eq 1 ]]; then
+						# store account details to connect spot account
+						echo $azure_list_accounts | jq -r --arg account "$account_to_connect" '.[] | select(.name==$account)' > $ACCOUNTS_STORE
+						connectAzureAccount
+						if [[ $SIGNAL_SPOT_AZURE_SUBSCRIPTION_CONNECTED_SUCCESS -eq 1 ]]; then
+							log_info "Successfully connected subscription to spot account."
 						fi
 					fi
 				fi
