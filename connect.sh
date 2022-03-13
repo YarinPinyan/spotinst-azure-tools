@@ -1,4 +1,4 @@
-#!/bin#!/bin/bash
+#!/bin/bash
 
 # Log levels, enums and constants
 readonly LOG_LEVEL_ERROR="ERROR"
